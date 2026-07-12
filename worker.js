@@ -1,9 +1,9 @@
 // =====================================
-// Bitcoin1070 Stock API
-// Cloudflare Worker v1.0
+// Bitcoin1070 Stock API v2.0
+// 固定銘柄 + アプリ追加銘柄に対応
 // =====================================
 
-const SYMBOLS = {
+const DEFAULT_SYMBOLS = {
     NVDA: "NVDA",
     MHI: "7011.T",
     ADVT: "6857.T",
@@ -30,20 +30,80 @@ function jsonResponse(data, status = 200) {
     );
 }
 
+// symbols=キー:Yahooコード,キー:Yahooコード
+// 例：AAPL:AAPL,INPEX:1605.T
+function parseRequestedSymbols(requestUrl) {
+    const url = new URL(requestUrl);
+    const symbolsParameter =
+        url.searchParams.get("symbols");
+
+    if (!symbolsParameter) {
+        return { ...DEFAULT_SYMBOLS };
+    }
+
+    const parsed = {};
+
+    symbolsParameter
+        .split(",")
+        .slice(0, 20)
+        .forEach(item => {
+            const separatorIndex =
+                item.indexOf(":");
+
+            if (separatorIndex <= 0) {
+                return;
+            }
+
+            const key =
+                item
+                    .slice(0, separatorIndex)
+                    .trim()
+                    .toUpperCase();
+
+            const yahooSymbol =
+                item
+                    .slice(separatorIndex + 1)
+                    .trim();
+
+            const validKey =
+                /^[A-Z0-9_-]{1,20}$/.test(key);
+
+            const validSymbol =
+                /^[A-Za-z0-9.^=_-]{1,30}$/.test(
+                    yahooSymbol
+                );
+
+            if (validKey && validSymbol) {
+                parsed[key] = yahooSymbol;
+            }
+        });
+
+    // ドル円は必ず取得
+    parsed.USDJPY = "JPY=X";
+
+    return Object.keys(parsed).length > 1
+        ? parsed
+        : { ...DEFAULT_SYMBOLS };
+}
+
 async function fetchYahooPrice(symbol) {
     const encodedSymbol =
         encodeURIComponent(symbol);
 
-    const url =
+    const endpoint =
         "https://query1.finance.yahoo.com/v8/finance/chart/" +
         encodedSymbol +
         "?interval=1m&range=1d";
 
-    const response = await fetch(url, {
+    const response = await fetch(endpoint, {
         headers: {
             "User-Agent":
-                "Mozilla/5.0 (compatible; Bitcoin1070/1.0)",
+                "Mozilla/5.0 (compatible; Bitcoin1070/2.0)",
             "Accept": "application/json"
+        },
+        cf: {
+            cacheTtl: 60,
+            cacheEverything: true
         }
     });
 
@@ -60,7 +120,7 @@ async function fetchYahooPrice(symbol) {
 
     if (!result) {
         throw new Error(
-            `${symbol}: 株価データなし`
+            `${symbol}: データなし`
         );
     }
 
@@ -71,11 +131,13 @@ async function fetchYahooPrice(symbol) {
 
     if (!Number.isFinite(price) || price <= 0) {
         const closes =
-            result?.indicators?.quote?.[0]?.close || [];
+            result?.indicators?.quote?.[0]?.close ||
+            [];
 
         const validCloses =
             closes.filter(value =>
-                Number.isFinite(Number(value))
+                Number.isFinite(Number(value)) &&
+                Number(value) > 0
             );
 
         price =
@@ -100,7 +162,8 @@ async function fetchYahooPrice(symbol) {
         updatedAt:
             Number(meta.regularMarketTime) > 0
                 ? new Date(
-                    Number(meta.regularMarketTime) * 1000
+                    Number(meta.regularMarketTime) *
+                    1000
                 ).toISOString()
                 : null
     };
@@ -119,15 +182,18 @@ export default {
             return jsonResponse(
                 {
                     error:
-                        "GETリクエストのみ対応しています"
+                        "GETリクエストのみ対応"
                 },
                 405
             );
         }
 
         try {
+            const requestedSymbols =
+                parseRequestedSymbols(request.url);
+
             const entries =
-                Object.entries(SYMBOLS);
+                Object.entries(requestedSymbols);
 
             const results =
                 await Promise.allSettled(
@@ -189,7 +255,7 @@ export default {
                 return jsonResponse(
                     {
                         error:
-                            "すべての株価取得に失敗しました",
+                            "すべての価格取得に失敗",
                         errors
                     },
                     502
@@ -202,15 +268,14 @@ export default {
                 errors,
                 fetchedAt:
                     new Date().toISOString(),
-                source:
-                    "Yahoo Finance chart data"
+                requestedSymbols
             });
 
         } catch (error) {
             return jsonResponse(
                 {
                     error:
-                        "株価APIでエラーが発生しました",
+                        "株価APIでエラーが発生",
                     message:
                         error?.message ||
                         String(error)
