@@ -1,1 +1,8 @@
-
+{
+  "name": "bitcoin1070-api",
+  "main": "worker.js",
+  "compatibility_date": "2026-07-12",
+  "observability": {
+    "enabled": true
+  }
+}
