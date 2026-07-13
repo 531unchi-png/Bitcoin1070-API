@@ -1,3 +1,3 @@
-# Bitcoin1070 API v4.0
+# Bitcoin1070 API v5.0
 
 Cloudflare Workers用の完成版です。
