@@ -1,5 +1,5 @@
 // =====================================
-// Bitcoin1070 Market API v3.0
+// Bitcoin1070 Market API v4.0
 // 現在価格 + 過去チャートデータ
 // =====================================
 
@@ -112,7 +112,7 @@ async function fetchYahooChart(
     const response = await fetch(endpoint, {
         headers: {
             "User-Agent":
-                "Mozilla/5.0 (compatible; Bitcoin1070/3.0)",
+                "Mozilla/5.0 (compatible; Bitcoin1070/4.0)",
             "Accept": "application/json"
         },
         cf: {
