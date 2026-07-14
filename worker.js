@@ -1,5 +1,5 @@
 // =====================================
-// Bitcoin1070 Market API v4.0
+// Bitcoin1070 Market API v8.2
 // 現在価格 + 過去チャートデータ
 // =====================================
 
@@ -112,7 +112,7 @@ async function fetchYahooChart(
     const response = await fetch(endpoint, {
         headers: {
             "User-Agent":
-                "Mozilla/5.0 (compatible; Bitcoin1070/4.0)",
+                "Mozilla/5.0 (compatible; Bitcoin1070/8.2)",
             "Accept": "application/json"
         },
         cf: {
@@ -453,6 +453,87 @@ async function handleHistory(url) {
     return jsonResponse(history);
 }
 
+
+
+// =====================================
+// 仮想通貨価格API v8.2
+// mode=crypto&ids=bitcoin,ethereum
+// =====================================
+
+const COINGECKO_ID_PATTERN = /^[a-z0-9-]{1,80}$/;
+
+function parseCryptoIds(url) {
+    const raw = String(url.searchParams.get("ids") || "bitcoin");
+    return [...new Set(raw.split(",").map(v => v.trim().toLowerCase()).filter(v => COINGECKO_ID_PATTERN.test(v)))].slice(0, 30);
+}
+
+async function fetchCoinGeckoJson(endpoint, cacheTtl = 60) {
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+            const response = await fetch(endpoint, {
+                headers: {
+                    "Accept": "application/json",
+                    "User-Agent": "Bitcoin1070-PRO/8.2"
+                },
+                cf: { cacheTtl, cacheEverything: true }
+            });
+            if (!response.ok) throw new Error(`CoinGecko HTTP ${response.status}`);
+            return await response.json();
+        } catch (error) {
+            lastError = error;
+            if (attempt === 0) await new Promise(resolve => setTimeout(resolve, 300));
+        }
+    }
+    throw lastError || new Error("CoinGecko取得失敗");
+}
+
+async function handleCryptoPrices(url) {
+    const ids = parseCryptoIds(url);
+    if (ids.length === 0) return jsonResponse({ error: "有効なidsを指定してください" }, 400);
+
+    const endpoint = "https://api.coingecko.com/api/v3/simple/price" +
+        `?ids=${encodeURIComponent(ids.join(","))}` +
+        "&vs_currencies=jpy&include_24hr_change=true&include_last_updated_at=true";
+
+    const data = await fetchCoinGeckoJson(endpoint, 60);
+    const prices = {};
+    const missing = [];
+
+    ids.forEach(id => {
+        const jpy = Number(data?.[id]?.jpy);
+        if (Number.isFinite(jpy) && jpy > 0) {
+            prices[id] = {
+                jpy,
+                jpy_24h_change: Number(data?.[id]?.jpy_24h_change) || 0,
+                last_updated_at: Number(data?.[id]?.last_updated_at) || null
+            };
+        } else {
+            missing.push(id);
+        }
+    });
+
+    if (Object.keys(prices).length === 0) {
+        return jsonResponse({ error: "仮想通貨価格を取得できませんでした", missing }, 502);
+    }
+
+    return jsonResponse({ prices, missing, fetchedAt: new Date().toISOString() });
+}
+
+async function handleCryptoHistory(url) {
+    const id = String(url.searchParams.get("id") || "bitcoin").trim().toLowerCase();
+    const daysRaw = Number(url.searchParams.get("days") || 120);
+    const days = Math.min(365, Math.max(30, Number.isFinite(daysRaw) ? Math.floor(daysRaw) : 120));
+    if (!COINGECKO_ID_PATTERN.test(id)) return jsonResponse({ error: "無効なidです" }, 400);
+
+    const endpoint = `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(id)}/market_chart` +
+        `?vs_currency=jpy&days=${days}&interval=daily`;
+    const data = await fetchCoinGeckoJson(endpoint, 300);
+    const prices = Array.isArray(data?.prices) ? data.prices.filter(row => Array.isArray(row) && Number(row[1]) > 0) : [];
+    if (prices.length === 0) return jsonResponse({ error: "履歴データなし" }, 502);
+    return jsonResponse({ id, days, prices, fetchedAt: new Date().toISOString() });
+}
+
 // =====================================
 // Worker
 // =====================================
@@ -495,6 +576,14 @@ export default {
                 url.searchParams.get(
                     "mode"
                 );
+
+            if (mode === "crypto") {
+                return await handleCryptoPrices(url);
+            }
+
+            if (mode === "crypto-history") {
+                return await handleCryptoHistory(url);
+            }
 
             if (
                 mode === "history"
