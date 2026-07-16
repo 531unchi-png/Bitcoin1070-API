@@ -1,5 +1,5 @@
 // =====================================
-// Bitcoin1070 Market API v10.0
+// Bitcoin1070 Market API v10.1
 // 現在価格 + 過去チャートデータ
 // =====================================
 
@@ -112,7 +112,7 @@ async function fetchYahooChart(
     const response = await fetch(endpoint, {
         headers: {
             "User-Agent":
-                "Mozilla/5.0 (compatible; Bitcoin1070/10.0)",
+                "Mozilla/5.0 (compatible; Bitcoin1070/10.1)",
             "Accept": "application/json"
         },
         cf: {
@@ -474,7 +474,7 @@ async function fetchCoinGeckoJson(endpoint, cacheTtl = 60) {
             const response = await fetch(endpoint, {
                 headers: {
                     "Accept": "application/json",
-                    "User-Agent": "Bitcoin1070-PRO/10.0"
+                    "User-Agent": "Bitcoin1070-PRO/10.1"
                 },
                 cf: { cacheTtl, cacheEverything: true }
             });
@@ -537,7 +537,7 @@ async function handleCryptoHistory(url) {
 
 
 // =====================================
-// 銘柄検索API v10.0
+// 銘柄検索API v10.1
 // mode=asset-search&q=9984&type=jp
 // =====================================
 
@@ -546,19 +546,45 @@ function normalizeSearchType(value) {
     return ["jp", "us", "crypto", "all"].includes(type) ? type : "all";
 }
 
-async function fetchYahooSearch(query) {
+function hiraToKata(value) {
+    return String(value || "").replace(/[ぁ-ゖ]/g, ch => String.fromCharCode(ch.charCodeAt(0) + 0x60));
+}
+
+async function fetchYahooSearchOnce(query) {
     const endpoint = "https://query1.finance.yahoo.com/v1/finance/search" +
         `?q=${encodeURIComponent(query)}` +
-        "&quotesCount=20&newsCount=0&enableFuzzyQuery=true";
+        "&quotesCount=50&newsCount=0&enableFuzzyQuery=true" +
+        "&lang=ja-JP&region=JP";
     const response = await fetch(endpoint, {
         headers: {
             "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (compatible; Bitcoin1070/10.0)"
+            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+            "User-Agent": "Mozilla/5.0 (compatible; Bitcoin1070/10.1)"
         },
         cf: { cacheTtl: 300, cacheEverything: true }
     });
     if (!response.ok) throw new Error(`Yahoo search HTTP ${response.status}`);
     return await response.json();
+}
+
+async function fetchYahooSearch(query) {
+    const variants = [...new Set([String(query || "").trim(), hiraToKata(query)].filter(Boolean))];
+    const settled = await Promise.allSettled(variants.map(fetchYahooSearchOnce));
+    const quotes = [];
+    const seen = new Set();
+    let firstError = null;
+    for (const result of settled) {
+        if (result.status === "rejected") {
+            firstError ||= result.reason;
+            continue;
+        }
+        for (const item of (Array.isArray(result.value?.quotes) ? result.value.quotes : [])) {
+            const key = String(item?.symbol || "");
+            if (key && !seen.has(key)) { seen.add(key); quotes.push(item); }
+        }
+    }
+    if (!quotes.length && firstError) throw firstError;
+    return { quotes };
 }
 
 async function fetchCoinGeckoSearch(query) {
@@ -567,13 +593,21 @@ async function fetchCoinGeckoSearch(query) {
     return await fetchCoinGeckoJson(endpoint, 300);
 }
 
+const JP_NAME_CORRECTIONS = {
+    "9984.T": "ソフトバンクグループ",
+    "9434.T": "ソフトバンク",
+    "6269.T": "三井海洋開発",
+    "285A.T": "キオクシアホールディングス",
+    "3556.T": "リネットジャパングループ"
+};
+
 function yahooResultToAsset(item) {
     const symbol = String(item?.symbol || "").toUpperCase();
     if (!symbol) return null;
     const isJapan = /\.T$/i.test(symbol);
     const type = isJapan ? "jp" : "us";
     const cleanSymbol = isJapan ? symbol.replace(/\.T$/i, "") : symbol;
-    const name = String(item?.shortname || item?.longname || item?.name || cleanSymbol).trim();
+    const name = JP_NAME_CORRECTIONS[symbol] || String(item?.longname || item?.shortname || item?.name || cleanSymbol).trim();
     const quoteType = String(item?.quoteType || "").toUpperCase();
     if (!["EQUITY", "ETF", "MUTUALFUND"].includes(quoteType)) return null;
     return {
