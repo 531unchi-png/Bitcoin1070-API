@@ -1,5 +1,5 @@
 // =====================================
-// Bitcoin1070 Market API v8.2
+// Bitcoin1070 Market API v10.0
 // 現在価格 + 過去チャートデータ
 // =====================================
 
@@ -112,7 +112,7 @@ async function fetchYahooChart(
     const response = await fetch(endpoint, {
         headers: {
             "User-Agent":
-                "Mozilla/5.0 (compatible; Bitcoin1070/8.2)",
+                "Mozilla/5.0 (compatible; Bitcoin1070/10.0)",
             "Accept": "application/json"
         },
         cf: {
@@ -474,7 +474,7 @@ async function fetchCoinGeckoJson(endpoint, cacheTtl = 60) {
             const response = await fetch(endpoint, {
                 headers: {
                     "Accept": "application/json",
-                    "User-Agent": "Bitcoin1070-PRO/8.2"
+                    "User-Agent": "Bitcoin1070-PRO/10.0"
                 },
                 cf: { cacheTtl, cacheEverything: true }
             });
@@ -534,6 +534,122 @@ async function handleCryptoHistory(url) {
     return jsonResponse({ id, days, prices, fetchedAt: new Date().toISOString() });
 }
 
+
+
+// =====================================
+// 銘柄検索API v10.0
+// mode=asset-search&q=9984&type=jp
+// =====================================
+
+function normalizeSearchType(value) {
+    const type = String(value || "").toLowerCase();
+    return ["jp", "us", "crypto", "all"].includes(type) ? type : "all";
+}
+
+async function fetchYahooSearch(query) {
+    const endpoint = "https://query1.finance.yahoo.com/v1/finance/search" +
+        `?q=${encodeURIComponent(query)}` +
+        "&quotesCount=20&newsCount=0&enableFuzzyQuery=true";
+    const response = await fetch(endpoint, {
+        headers: {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; Bitcoin1070/10.0)"
+        },
+        cf: { cacheTtl: 300, cacheEverything: true }
+    });
+    if (!response.ok) throw new Error(`Yahoo search HTTP ${response.status}`);
+    return await response.json();
+}
+
+async function fetchCoinGeckoSearch(query) {
+    const endpoint = "https://api.coingecko.com/api/v3/search" +
+        `?query=${encodeURIComponent(query)}`;
+    return await fetchCoinGeckoJson(endpoint, 300);
+}
+
+function yahooResultToAsset(item) {
+    const symbol = String(item?.symbol || "").toUpperCase();
+    if (!symbol) return null;
+    const isJapan = /\.T$/i.test(symbol);
+    const type = isJapan ? "jp" : "us";
+    const cleanSymbol = isJapan ? symbol.replace(/\.T$/i, "") : symbol;
+    const name = String(item?.shortname || item?.longname || item?.name || cleanSymbol).trim();
+    const quoteType = String(item?.quoteType || "").toUpperCase();
+    if (!["EQUITY", "ETF", "MUTUALFUND"].includes(quoteType)) return null;
+    return {
+        type,
+        symbol: cleanSymbol,
+        name,
+        yahooSymbol: symbol,
+        exchange: item?.exchange || item?.exchDisp || "",
+        source: "yahoo"
+    };
+}
+
+function coinResultToAsset(item) {
+    const id = String(item?.id || "").trim().toLowerCase();
+    const symbol = String(item?.symbol || "").trim().toUpperCase();
+    const name = String(item?.name || symbol).trim();
+    if (!id || !symbol) return null;
+    return {
+        type: "crypto",
+        symbol,
+        name,
+        coinGeckoId: id,
+        marketCapRank: Number(item?.market_cap_rank) || null,
+        source: "coingecko"
+    };
+}
+
+async function handleAssetSearch(url) {
+    const query = String(url.searchParams.get("q") || "").trim();
+    const type = normalizeSearchType(url.searchParams.get("type"));
+    if (query.length < 1) return jsonResponse({ error: "qを指定してください" }, 400);
+
+    const tasks = [];
+    if (type === "all" || type === "jp" || type === "us") tasks.push(fetchYahooSearch(query));
+    else tasks.push(Promise.resolve(null));
+    if (type === "all" || type === "crypto") tasks.push(fetchCoinGeckoSearch(query));
+    else tasks.push(Promise.resolve(null));
+
+    const [yahooSettled, cryptoSettled] = await Promise.allSettled(tasks);
+    const results = [];
+    const errors = [];
+
+    if (yahooSettled.status === "fulfilled" && yahooSettled.value) {
+        const quotes = Array.isArray(yahooSettled.value?.quotes) ? yahooSettled.value.quotes : [];
+        quotes.map(yahooResultToAsset).filter(Boolean).forEach(item => {
+            if (type === "all" || item.type === type) results.push(item);
+        });
+    } else if (yahooSettled.status === "rejected") {
+        errors.push(yahooSettled.reason?.message || "Yahoo検索失敗");
+    }
+
+    if (cryptoSettled.status === "fulfilled" && cryptoSettled.value) {
+        const coins = Array.isArray(cryptoSettled.value?.coins) ? cryptoSettled.value.coins : [];
+        coins.slice(0, 20).map(coinResultToAsset).filter(Boolean).forEach(item => results.push(item));
+    } else if (cryptoSettled.status === "rejected") {
+        errors.push(cryptoSettled.reason?.message || "CoinGecko検索失敗");
+    }
+
+    // 日本株コードならYahoo結果がなくても入力を止めない
+    if ((type === "jp" || type === "all") && /^(?:[0-9]{4}|[0-9]{3}[A-Z])$/i.test(query)) {
+        const clean = query.toUpperCase().replace(/\.T$/i, "");
+        if (!results.some(item => item.type === "jp" && item.symbol === clean)) {
+            results.push({ type: "jp", symbol: clean, name: `日本株 ${clean}`, yahooSymbol: `${clean}.T`, source: "fallback" });
+        }
+    }
+
+    const unique = [];
+    const seen = new Set();
+    for (const item of results) {
+        const key = `${item.type}:${item.coinGeckoId || item.yahooSymbol || item.symbol}`;
+        if (!seen.has(key)) { seen.add(key); unique.push(item); }
+    }
+
+    return jsonResponse({ query, type, results: unique.slice(0, 20), errors, fetchedAt: new Date().toISOString() });
+}
+
 // =====================================
 // Worker
 // =====================================
@@ -576,6 +692,10 @@ export default {
                 url.searchParams.get(
                     "mode"
                 );
+
+            if (mode === "asset-search") {
+                return await handleAssetSearch(url);
+            }
 
             if (mode === "crypto") {
                 return await handleCryptoPrices(url);

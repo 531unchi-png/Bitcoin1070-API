@@ -1,7 +1,7 @@
-# Bitcoin1070 API v8.2
+# Bitcoin1070 API v10.0
 
-Yahoo Finance株価に加え、CoinGecko仮想通貨価格をプロキシします。
+- 株価・為替
+- 仮想通貨価格・履歴
+- v10.0 銘柄横断検索API (`mode=asset-search`)
 
-- `?mode=crypto&ids=bitcoin,ethereum`
-- `?mode=crypto-history&id=bitcoin&days=120`
-- `?mode=history&symbol=NVDA`
+PRO v10.0より先にデプロイしてください。
