@@ -1,5 +1,5 @@
 // =====================================
-// Bitcoin1070 Market API v10.1
+// Bitcoin1070 Market API v11.6
 // 現在価格 + 過去チャートデータ
 // =====================================
 
@@ -112,7 +112,7 @@ async function fetchYahooChart(
     const response = await fetch(endpoint, {
         headers: {
             "User-Agent":
-                "Mozilla/5.0 (compatible; Bitcoin1070/10.1)",
+                "Mozilla/5.0 (compatible; Bitcoin1070/11.6)",
             "Accept": "application/json"
         },
         cf: {
@@ -474,7 +474,7 @@ async function fetchCoinGeckoJson(endpoint, cacheTtl = 60) {
             const response = await fetch(endpoint, {
                 headers: {
                     "Accept": "application/json",
-                    "User-Agent": "Bitcoin1070-PRO/10.1"
+                    "User-Agent": "Bitcoin1070-PRO/11.6"
                 },
                 cf: { cacheTtl, cacheEverything: true }
             });
@@ -536,6 +536,103 @@ async function handleCryptoHistory(url) {
 
 
 
+
+// =====================================
+// BTC長期サイクルAPI v11.6
+// mode=btc-cycle
+// Yahoo Finance BTC-JPYの週足を優先し、現在価格も同時返却
+// =====================================
+
+async function fetchBtcLongHistoryYahoo() {
+    const result = await fetchYahooChart("BTC-JPY", "1wk", "max");
+    const timestamps = result.timestamp || [];
+    const quote = result?.indicators?.quote?.[0] || {};
+    const adjustedClose = result?.indicators?.adjclose?.[0]?.adjclose || [];
+    const candles = [];
+
+    timestamps.forEach((timestamp, index) => {
+        const close = Number(adjustedClose[index] ?? quote.close?.[index]);
+        if (!Number.isFinite(close) || close <= 0) return;
+        candles.push({
+            date: new Date(timestamp * 1000).toISOString(),
+            open: Number(quote.open?.[index]) || close,
+            high: Number(quote.high?.[index]) || close,
+            low: Number(quote.low?.[index]) || close,
+            close,
+            volume: Number(quote.volume?.[index]) || 0
+        });
+    });
+
+    if (candles.length < 100) throw new Error("BTC-JPY長期履歴が不足しています");
+    const meta = result.meta || {};
+    const latest = candles[candles.length - 1];
+    return {
+        source: "yahoo",
+        symbol: "BTC-JPY",
+        currency: meta.currency || "JPY",
+        currentPrice: Number(meta.regularMarketPrice) > 0 ? Number(meta.regularMarketPrice) : latest.close,
+        updatedAt: Number(meta.regularMarketTime) > 0 ? new Date(Number(meta.regularMarketTime) * 1000).toISOString() : latest.date,
+        candles
+    };
+}
+
+async function fetchBtcLongHistoryCoinGecko() {
+    const endpoint = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart" +
+        "?vs_currency=jpy&days=max&interval=daily";
+    const data = await fetchCoinGeckoJson(endpoint, 900);
+    const raw = Array.isArray(data?.prices) ? data.prices : [];
+    const candles = raw
+        .filter((row, index) => Array.isArray(row) && Number(row[1]) > 0 && (index % 7 === 0 || index === raw.length - 1))
+        .map(row => ({
+            date: new Date(Number(row[0])).toISOString(),
+            open: Number(row[1]), high: Number(row[1]), low: Number(row[1]), close: Number(row[1]), volume: 0
+        }));
+    if (candles.length < 100) throw new Error("CoinGecko長期履歴が不足しています");
+    return {
+        source: "coingecko",
+        symbol: "bitcoin",
+        currency: "JPY",
+        currentPrice: candles[candles.length - 1].close,
+        updatedAt: candles[candles.length - 1].date,
+        candles
+    };
+}
+
+async function handleBtcCycle() {
+    const errors = [];
+    try {
+        const result = await fetchBtcLongHistoryYahoo();
+        return jsonResponse({ ...result, count: result.candles.length, errors, fetchedAt: new Date().toISOString() });
+    } catch (error) {
+        errors.push(`Yahoo: ${error?.message || String(error)}`);
+    }
+    try {
+        const result = await fetchBtcLongHistoryCoinGecko();
+        return jsonResponse({ ...result, count: result.candles.length, errors, fetchedAt: new Date().toISOString() });
+    } catch (error) {
+        errors.push(`CoinGecko: ${error?.message || String(error)}`);
+    }
+    return jsonResponse({ error: "BTC長期履歴を取得できませんでした", errors }, 502);
+}
+
+async function handleFearGreed() {
+    const response = await fetch("https://api.alternative.me/fng/?limit=1", {
+        headers: { "Accept": "application/json", "User-Agent": "Bitcoin1070-PRO/11.6" },
+        cf: { cacheTtl: 300, cacheEverything: true }
+    });
+    if (!response.ok) throw new Error(`Fear & Greed HTTP ${response.status}`);
+    const data = await response.json();
+    const item = data?.data?.[0];
+    const value = Number(item?.value);
+    if (!Number.isFinite(value)) throw new Error("Fear & Greedデータ不正");
+    return jsonResponse({
+        value,
+        classification: String(item?.value_classification || ""),
+        timestamp: item?.timestamp || null,
+        fetchedAt: new Date().toISOString()
+    });
+}
+
 // =====================================
 // 銘柄検索API v10.1
 // mode=asset-search&q=9984&type=jp
@@ -559,7 +656,7 @@ async function fetchYahooSearchOnce(query) {
         headers: {
             "Accept": "application/json",
             "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
-            "User-Agent": "Mozilla/5.0 (compatible; Bitcoin1070/10.1)"
+            "User-Agent": "Mozilla/5.0 (compatible; Bitcoin1070/11.6)"
         },
         cf: { cacheTtl: 300, cacheEverything: true }
     });
@@ -726,6 +823,14 @@ export default {
                 url.searchParams.get(
                     "mode"
                 );
+
+            if (mode === "btc-cycle") {
+                return await handleBtcCycle();
+            }
+
+            if (mode === "fear-greed") {
+                return await handleFearGreed();
+            }
 
             if (mode === "asset-search") {
                 return await handleAssetSearch(url);
