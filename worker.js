@@ -640,11 +640,38 @@ async function handleFearGreed() {
 
 function normalizeSearchType(value) {
     const type = String(value || "").toLowerCase();
-    return ["jp", "us", "crypto", "all"].includes(type) ? type : "all";
+    return ["jp", "us", "crypto", "all"].includes(type) ? type : null;
 }
 
 function hiraToKata(value) {
     return String(value || "").replace(/[ぁ-ゖ]/g, ch => String.fromCharCode(ch.charCodeAt(0) + 0x60));
+}
+
+function kataToHira(value) {
+    return String(value || "").replace(/[ァ-ヶ]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0x60));
+}
+
+function normalizeSearchText(value) {
+    return String(value || "").normalize("NFKC").replace(/\s+/g, " ").trim();
+}
+
+const SEARCH_TIMEOUT_MS = 4500;
+const SEARCH_RESULT_LIMIT_DEFAULT = 20;
+const SEARCH_RESULT_LIMIT_MAX = 50;
+
+async function fetchJsonWithTimeout(endpoint, options, timeoutMs = SEARCH_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(endpoint, { ...options, signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
+    } catch (error) {
+        if (error?.name === "AbortError") throw new Error("外部検索がタイムアウトしました");
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 async function fetchYahooSearchOnce(query) {
@@ -652,7 +679,7 @@ async function fetchYahooSearchOnce(query) {
         `?q=${encodeURIComponent(query)}` +
         "&quotesCount=50&newsCount=0&enableFuzzyQuery=true" +
         "&lang=ja-JP&region=JP";
-    const response = await fetch(endpoint, {
+    return await fetchJsonWithTimeout(endpoint, {
         headers: {
             "Accept": "application/json",
             "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
@@ -660,12 +687,11 @@ async function fetchYahooSearchOnce(query) {
         },
         cf: { cacheTtl: 300, cacheEverything: true }
     });
-    if (!response.ok) throw new Error(`Yahoo search HTTP ${response.status}`);
-    return await response.json();
 }
 
 async function fetchYahooSearch(query) {
-    const variants = [...new Set([String(query || "").trim(), hiraToKata(query)].filter(Boolean))];
+    const normalized = normalizeSearchText(query);
+    const variants = [...new Set([normalized, hiraToKata(normalized), kataToHira(normalized)].filter(Boolean))].slice(0, 3);
     const settled = await Promise.allSettled(variants.map(fetchYahooSearchOnce));
     const quotes = [];
     const seen = new Set();
@@ -687,7 +713,10 @@ async function fetchYahooSearch(query) {
 async function fetchCoinGeckoSearch(query) {
     const endpoint = "https://api.coingecko.com/api/v3/search" +
         `?query=${encodeURIComponent(query)}`;
-    return await fetchCoinGeckoJson(endpoint, 300);
+    return await fetchJsonWithTimeout(endpoint, {
+        headers: { "Accept": "application/json", "User-Agent": "Bitcoin1070-PRO/12.4" },
+        cf: { cacheTtl: 300, cacheEverything: true }
+    });
 }
 
 const JP_NAME_CORRECTIONS = {
@@ -732,10 +761,55 @@ function coinResultToAsset(item) {
     };
 }
 
+// External search remains the source of truth. This small alias index makes the
+// most frequently used Japanese names/kana useful even when a provider only
+// indexes an English legal name.
+const ASSET_SEARCH_ALIASES = [
+    { type: "jp", symbol: "7203", name: "トヨタ自動車", yahooSymbol: "7203.T", aliases: "とよた トヨタ toyota" },
+    { type: "jp", symbol: "6758", name: "ソニーグループ", yahooSymbol: "6758.T", aliases: "そにー ソニー sony" },
+    { type: "jp", symbol: "9984", name: "ソフトバンクグループ", yahooSymbol: "9984.T", aliases: "そふとばんく softbank sbg" },
+    { type: "jp", symbol: "9432", name: "日本電信電話", yahooSymbol: "9432.T", aliases: "にほんでんしんでんわ えぬてぃてぃ エヌティティ ntt" },
+    { type: "jp", symbol: "8306", name: "三菱UFJフィナンシャル・グループ", yahooSymbol: "8306.T", aliases: "みつびし ゆーえふじぇい mufg" },
+    { type: "jp", symbol: "7011", name: "三菱重工業", yahooSymbol: "7011.T", aliases: "みつびしじゅうこう 三菱重工 mhi" },
+    { type: "us", symbol: "AAPL", name: "Apple Inc.", yahooSymbol: "AAPL", aliases: "apple アップル あっぷる" },
+    { type: "us", symbol: "MSFT", name: "Microsoft Corporation", yahooSymbol: "MSFT", aliases: "microsoft マイクロソフト まいくろそふと" },
+    { type: "us", symbol: "NVDA", name: "NVIDIA Corporation", yahooSymbol: "NVDA", aliases: "nvidia エヌビディア えぬびでぃあ" },
+    { type: "us", symbol: "TSLA", name: "Tesla, Inc.", yahooSymbol: "TSLA", aliases: "tesla テスラ てすら" },
+    { type: "crypto", symbol: "BTC", name: "Bitcoin", coinGeckoId: "bitcoin", aliases: "bitcoin ビットコイン びっとこいん" },
+    { type: "crypto", symbol: "ETH", name: "Ethereum", coinGeckoId: "ethereum", aliases: "ethereum イーサリアム いーさりあむ イーサ" },
+    { type: "crypto", symbol: "XRP", name: "XRP", coinGeckoId: "ripple", aliases: "ripple リップル りっぷる" },
+    { type: "crypto", symbol: "SOL", name: "Solana", coinGeckoId: "solana", aliases: "solana ソラナ そらな" }
+];
+
+function findAliasResults(query, type) {
+    const needle = kataToHira(normalizeSearchText(query)).toLocaleLowerCase("ja");
+    return ASSET_SEARCH_ALIASES.filter(item => {
+        if (type !== "all" && item.type !== type) return false;
+        const haystack = kataToHira(`${item.symbol} ${item.name} ${item.yahooSymbol || ""} ${item.coinGeckoId || ""} ${item.aliases}`).toLocaleLowerCase("ja");
+        return haystack.includes(needle);
+    }).map(({ aliases, ...item }) => ({ ...item, source: "local" }));
+}
+
+function resultScore(item, query) {
+    const needle = kataToHira(query).toLocaleLowerCase("ja");
+    const symbol = String(item.symbol || "").toLocaleLowerCase("ja");
+    const name = kataToHira(item.name || "").toLocaleLowerCase("ja");
+    if (symbol === needle || String(item.yahooSymbol || "").toLocaleLowerCase("ja") === needle || item.coinGeckoId === needle) return 0;
+    if (name === needle) return 1;
+    if (symbol.startsWith(needle) || name.startsWith(needle)) return 2;
+    return 3;
+}
+
 async function handleAssetSearch(url) {
-    const query = String(url.searchParams.get("q") || "").trim();
-    const type = normalizeSearchType(url.searchParams.get("type"));
+    const query = normalizeSearchText(url.searchParams.get("q"));
+    const rawType = url.searchParams.get("type");
+    const type = normalizeSearchType(rawType || "all");
     if (query.length < 1) return jsonResponse({ error: "qを指定してください" }, 400);
+    if (query.length > 80) return jsonResponse({ error: "qは80文字以内で指定してください" }, 400);
+    if (!type) return jsonResponse({ error: "typeはjp、us、crypto、allのいずれかを指定してください" }, 400);
+    const rawLimit = url.searchParams.get("limit");
+    if (rawLimit !== null && !/^\d+$/.test(rawLimit)) return jsonResponse({ error: "limitは整数で指定してください" }, 400);
+    const limit = Math.min(SEARCH_RESULT_LIMIT_MAX, Math.max(1, Number(rawLimit) || SEARCH_RESULT_LIMIT_DEFAULT));
 
     const tasks = [];
     if (type === "all" || type === "jp" || type === "us") tasks.push(fetchYahooSearch(query));
@@ -744,7 +818,7 @@ async function handleAssetSearch(url) {
     else tasks.push(Promise.resolve(null));
 
     const [yahooSettled, cryptoSettled] = await Promise.allSettled(tasks);
-    const results = [];
+    const results = findAliasResults(query, type);
     const errors = [];
 
     if (yahooSettled.status === "fulfilled" && yahooSettled.value) {
@@ -778,7 +852,11 @@ async function handleAssetSearch(url) {
         if (!seen.has(key)) { seen.add(key); unique.push(item); }
     }
 
-    return jsonResponse({ query, type, results: unique.slice(0, 20), errors, fetchedAt: new Date().toISOString() });
+    unique.sort((a, b) => resultScore(a, query) - resultScore(b, query));
+    if (!unique.length && errors.length) {
+        return jsonResponse({ query, type, results: [], errors, fetchedAt: new Date().toISOString() }, 502);
+    }
+    return jsonResponse({ query, type, results: unique.slice(0, limit), errors, fetchedAt: new Date().toISOString() });
 }
 
 // =====================================
