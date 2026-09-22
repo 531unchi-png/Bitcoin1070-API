@@ -92,3 +92,46 @@ test("existing history and current-price modes retain their response contracts",
     assert.equal(history.symbol, "AAPL");
     assert.equal(history.candles[0].close, 123);
 });
+
+test("btc-cycle requests bounded Yahoo windows and returns validated weekly history", async () => {
+    let windows = 0;
+    globalThis.fetch = async url => {
+        const u = new URL(String(url));
+        assert.equal(u.searchParams.get("interval"), "1wk");
+        assert.equal(u.searchParams.has("range"), false);
+        const start = Number(u.searchParams.get("period1")) * 1000;
+        const end = Number(u.searchParams.get("period2")) * 1000;
+        assert.ok(end - start < 910 * 86400000);
+        windows++;
+        const timestamp = [], close = [];
+        for (let ms = start; ms < end; ms += 7 * 86400000) {
+            timestamp.push(Math.floor(ms / 1000)); close.push(100 + timestamp.length);
+        }
+        return json({ chart: { result: [{ timestamp, meta: { currency: "JPY", regularMarketPrice: 1000 }, indicators: { quote: [{ close }] } }] } });
+    };
+    const response = await worker.fetch(new Request("https://example.test/?mode=btc-cycle"));
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.source, "yahoo");
+    assert.ok(windows >= 5);
+    assert.ok(body.count > 400);
+    assert.equal(body.cadenceDays, 7);
+});
+
+test("btc-cycle rejects misleading monthly data and never labels it weekly", async () => {
+    globalThis.fetch = async url => {
+        const u = new URL(String(url));
+        if (u.hostname.includes("coingecko")) return new Response("unavailable", { status: 503 });
+        const start = Number(u.searchParams.get("period1")) * 1000;
+        const end = Number(u.searchParams.get("period2")) * 1000;
+        const timestamp = [], close = [];
+        for (let ms = start; ms < end; ms += 31 * 86400000) {
+            timestamp.push(Math.floor(ms / 1000)); close.push(100);
+        }
+        return json({ chart: { result: [{ timestamp, indicators: { quote: [{ close }] } }] } });
+    };
+    const response = await worker.fetch(new Request("https://example.test/?mode=btc-cycle"));
+    const body = await response.json();
+    assert.equal(response.status, 502);
+    assert.match(body.errors[0], /粒度・期間が不足/);
+});
