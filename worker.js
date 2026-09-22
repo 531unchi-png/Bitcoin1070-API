@@ -96,7 +96,9 @@ function parseRequestedSymbols(url) {
 async function fetchYahooChart(
     symbol,
     interval,
-    range
+    range,
+    period1 = null,
+    period2 = null
 ) {
     const encodedSymbol =
         encodeURIComponent(symbol);
@@ -105,7 +107,9 @@ async function fetchYahooChart(
         "https://query1.finance.yahoo.com/v8/finance/chart/" +
         encodedSymbol +
         `?interval=${interval}` +
-        `&range=${range}` +
+        (period1 !== null && period2 !== null
+            ? `&period1=${period1}&period2=${period2}`
+            : `&range=${range}`) +
         "&includePrePost=false" +
         "&events=div%2Csplits";
 
@@ -540,34 +544,53 @@ async function handleCryptoHistory(url) {
 // =====================================
 // BTC長期サイクルAPI v11.6
 // mode=btc-cycle
-// Yahoo Finance BTC-JPYの週足を優先し、現在価格も同時返却
+// Yahoo Finance BTC-JPYの実際の観測間隔を検査し、現在価格も同時返却
 // =====================================
 
-async function fetchBtcLongHistoryYahoo() {
-    const result = await fetchYahooChart("BTC-JPY", "1wk", "max");
-    const timestamps = result.timestamp || [];
-    const quote = result?.indicators?.quote?.[0] || {};
-    const adjustedClose = result?.indicators?.adjclose?.[0]?.adjclose || [];
-    const candles = [];
+function validateBtcCycleCadence(candles, source) {
+    const days = [...new Set(candles.map(c => Date.parse(c.date)).filter(Number.isFinite))].sort((a, b) => a - b);
+    const gaps = days.slice(1).map((day, i) => (day - days[i]) / 86400000).sort((a, b) => a - b);
+    const median = gaps[Math.floor(gaps.length / 2)] || Infinity;
+    if (days.length < 400 || median > 10 || days[0] > Date.parse("2014-12-01") ||
+        days[days.length - 1] < Date.now() - 21 * 86400000 || gaps[gaps.length - 1] > 35) {
+        throw new Error(`${source}: BTC履歴の粒度・期間が不足（${days.length}点、中央値${Math.round(median)}日）`);
+    }
+    return Math.round(median);
+}
 
-    timestamps.forEach((timestamp, index) => {
-        const close = Number(adjustedClose[index] ?? quote.close?.[index]);
-        if (!Number.isFinite(close) || close <= 0) return;
-        candles.push({
-            date: new Date(timestamp * 1000).toISOString(),
-            open: Number(quote.open?.[index]) || close,
-            high: Number(quote.high?.[index]) || close,
-            low: Number(quote.low?.[index]) || close,
-            close,
-            volume: Number(quote.volume?.[index]) || 0
+async function fetchBtcLongHistoryYahoo() {
+    // Yahoo may silently return monthly points for range=max despite interval=1wk.
+    // Request shorter overlapping windows and reject the result unless it is weekly in fact.
+    const since = Date.parse("2014-09-01"), until = Date.now() + 86400000, span = 900 * 86400000;
+    const windows = [];
+    for (let start = since; start < until; start += span) {
+        windows.push([Math.floor(start / 1000), Math.floor(Math.min(start + span + 7 * 86400000, until) / 1000)]);
+    }
+    const results = await Promise.all(windows.map(([start, end]) => fetchYahooChart("BTC-JPY", "1wk", null, start, end)));
+    const byDay = new Map();
+    results.forEach(result => {
+        const quote = result?.indicators?.quote?.[0] || {};
+        const adjustedClose = result?.indicators?.adjclose?.[0]?.adjclose || [];
+        (result.timestamp || []).forEach((timestamp, index) => {
+            const close = Number(adjustedClose[index] ?? quote.close?.[index]);
+            if (!Number.isFinite(close) || close <= 0) return;
+            const day = new Date(timestamp * 1000).toISOString().slice(0, 10);
+            byDay.set(day, {
+                date: new Date(timestamp * 1000).toISOString(),
+                open: Number(quote.open?.[index]) || close,
+                high: Number(quote.high?.[index]) || close,
+                low: Number(quote.low?.[index]) || close,
+                close, volume: Number(quote.volume?.[index]) || 0
+            });
         });
     });
-
-    if (candles.length < 100) throw new Error("BTC-JPY長期履歴が不足しています");
-    const meta = result.meta || {};
+    const candles = [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date));
+    const cadenceDays = validateBtcCycleCadence(candles, "Yahoo");
+    const meta = results[results.length - 1].meta || {};
     const latest = candles[candles.length - 1];
     return {
         source: "yahoo",
+        cadenceDays,
         symbol: "BTC-JPY",
         currency: meta.currency || "JPY",
         currentPrice: Number(meta.regularMarketPrice) > 0 ? Number(meta.regularMarketPrice) : latest.close,
@@ -587,9 +610,10 @@ async function fetchBtcLongHistoryCoinGecko() {
             date: new Date(Number(row[0])).toISOString(),
             open: Number(row[1]), high: Number(row[1]), low: Number(row[1]), close: Number(row[1]), volume: 0
         }));
-    if (candles.length < 100) throw new Error("CoinGecko長期履歴が不足しています");
+    const cadenceDays = validateBtcCycleCadence(candles, "CoinGecko");
     return {
         source: "coingecko",
+        cadenceDays,
         symbol: "bitcoin",
         currency: "JPY",
         currentPrice: candles[candles.length - 1].close,
