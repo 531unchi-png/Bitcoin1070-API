@@ -12,6 +12,36 @@ function json(data, status = 200) {
     });
 }
 
+test("fund NAV uses the official association code and returns dated quotes per fund", async () => {
+    globalThis.fetch = async url => {
+        const code = String(url).split("/").at(-1);
+        assert.match(String(url), /^https:\/\/developer\.am\.mufg\.jp\/fund_information_latest\/association_fund_cd\//);
+        return json({ datasets: [{ association_fund_cd: code, nav: code === "0331418A" ? 38325 : 45049, base_date: 20260925 }] });
+    };
+    const response = await worker.fetch(new Request("https://example.test/?mode=fund-nav&symbols=0331418A,03311187"));
+    assert.equal(response.status, 200);
+    const data = await response.json();
+    assert.deepEqual(data.funds["0331418A"], { navJpy: 38325, navDate: "2026-09-25", source: "mufg" });
+    assert.equal(data.funds["03311187"].navJpy, 45049);
+});
+
+test("fund NAV refuses mismatched data and keeps partial success", async () => {
+    globalThis.fetch = async url => String(url).endsWith("0331418A")
+        ? json({ datasets: [{ association_fund_cd: "0331418A", nav: 38325, base_date: 20260925 }] })
+        : json({ datasets: [{ association_fund_cd: "WRONG", nav: 45049, base_date: 20260925 }] });
+    const response = await worker.fetch(new Request("https://example.test/?mode=fund-nav&symbols=0331418A,03311187"));
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(Object.keys(body.funds), ["0331418A"]);
+    assert.ok(body.errors["03311187"]);
+    const invalid = await worker.fetch(new Request("https://example.test/?mode=fund-nav&symbols=12345678"));
+    assert.equal(invalid.status, 400);
+    globalThis.fetch = async () => json({}, 403);
+    const unavailable = await worker.fetch(new Request("https://example.test/?mode=fund-nav&symbols=0331418A"));
+    assert.equal(unavailable.status, 502);
+    assert.deepEqual((await unavailable.json()).funds, {});
+});
+
 test("asset-search returns the PRO-compatible Japanese equity shape", async () => {
     globalThis.fetch = async url => {
         if (String(url).includes("finance/search")) return json({ quotes: [] });
