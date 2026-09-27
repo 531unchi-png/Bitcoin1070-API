@@ -20,6 +20,53 @@ const CORS_HEADERS = {
     "Cache-Control": "public, max-age=60"
 };
 
+// Only these two eMAXIS Slim funds have verified association codes in the app.
+// MUFG's public fund-information API returns NAV per 10,000 units and its base date.
+const FUND_CODES = new Set(["0331418A", "03311187"]);
+
+async function fetchFundNav(symbol) {
+    const endpoint = `https://developer.am.mufg.jp/fund_information_latest/association_fund_cd/${symbol}`;
+    const response = await fetch(endpoint, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(8000),
+        cf: { cacheTtl: 3600, cacheEverything: true }
+    });
+    if (!response.ok) throw new Error(`配信元 HTTP ${response.status}`);
+    const payload = await response.json();
+    const item = payload?.datasets?.[0];
+    if (String(item?.association_fund_cd || "").toUpperCase() !== symbol) {
+        throw new Error("ファンドコードが一致しません");
+    }
+    const price = Number(item.nav);
+    const rawDate = String(item.base_date || "");
+    const date = /^\d{8}$/.test(rawDate)
+        ? `${rawDate.slice(0, 4)}-${rawDate.slice(4, 6)}-${rawDate.slice(6)}` : "";
+    const todayJst = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit"
+    }).format(new Date());
+    if (!Number.isFinite(price) || price <= 0 || price > 1000000 ||
+        !date || new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date ||
+        date > todayJst) throw new Error("基準価額または公表日が不正です");
+    return { navJpy: price, navDate: date, source: "mufg" };
+}
+
+async function handleFundNav(url) {
+    const raw = String(url.searchParams.get("symbols") || "");
+    const requested = [...new Set(raw.split(",").map(s => s.trim().toUpperCase()).filter(Boolean))];
+    if (!requested.length || requested.length > 2 || requested.some(s => !FUND_CODES.has(s))) {
+        return jsonResponse({ error: "対応する投資信託コードを指定してください" }, 400);
+    }
+    const settled = await Promise.allSettled(requested.map(fetchFundNav));
+    const funds = {}, errors = {};
+    settled.forEach((result, index) => {
+        const symbol = requested[index];
+        if (result.status === "fulfilled") funds[symbol] = result.value;
+        else errors[symbol] = result.reason?.message || "取得失敗";
+    });
+    return jsonResponse({ funds, errors, fetchedAt: new Date().toISOString() },
+        Object.keys(funds).length ? 200 : 502);
+}
+
 function jsonResponse(data, status = 200) {
     return new Response(
         JSON.stringify(data),
@@ -936,6 +983,10 @@ export default {
 
             if (mode === "asset-search") {
                 return await handleAssetSearch(url);
+            }
+
+            if (mode === "fund-nav") {
+                return await handleFundNav(url);
             }
 
             if (mode === "crypto") {
